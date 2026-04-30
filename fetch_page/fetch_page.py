@@ -460,10 +460,145 @@ def _try_huggingface(url: str, client: httpx.Client, deadline: Deadline) -> str 
         return None
 
 
+def _try_mouser(url: str, client: httpx.Client, deadline: Deadline) -> str | None:
+    """Mouser Search API shortcut. Requires MOUSER_API_KEY env var.
+
+    Triggers on:
+      - mouser.com URLs (extracts part number from path or query)
+      - mouser.com/ProductDetail/<part> or Search/Refine?Keyword=<part>
+    """
+    api_key = os.environ.get("MOUSER_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    parsed = urlparse(url)
+    if not _host_matches(parsed.netloc, "mouser.com"):
+        return None
+
+    # Extract part number from URL
+    part_number = None
+    path = parsed.path.strip("/")
+
+    # /ProductDetail/<manufacturer-part-number>
+    if path.lower().startswith("productdetail/"):
+        segments = path.split("/")
+        if len(segments) >= 2:
+            part_number = segments[-1]
+
+    # /Search/Refine?Keyword=<part>
+    if not part_number and "keyword" in parsed.query.lower():
+        from urllib.parse import parse_qs
+        qs = parse_qs(parsed.query)
+        # Case-insensitive query param lookup
+        for k, v in qs.items():
+            if k.lower() == "keyword" and v:
+                part_number = v[0]
+                break
+
+    # /<mouser-sku> or /<manufacturer-part>
+    if not part_number and path and "/" not in path:
+        part_number = path
+
+    if not part_number:
+        return None
+
+    return _mouser_api_search(part_number, api_key, client, deadline)
+
+
+def _mouser_api_search(
+    part_number: str, api_key: str, client: httpx.Client, deadline: Deadline
+) -> str | None:
+    """Call Mouser Search API and format results as markdown."""
+    api_url = f"https://api.mouser.com/api/v1.0/search/partnumber?apiKey={api_key}"
+    payload = {
+        "SearchByPartRequest": {
+            "mouserPartNumber": part_number,
+            "partSearchOptions": "Exact",
+        }
+    }
+
+    try:
+        resp = client.post(
+            api_url,
+            json=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=deadline.remaining_int(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        errors = data.get("Errors", [])
+        if errors:
+            msg = errors[0].get("Message", "Unknown error")
+            print(f"[mouser-api] Error: {msg}", file=sys.stderr)
+            return None
+
+        results = data.get("SearchResults", {})
+        parts = results.get("Parts", [])
+        if not parts:
+            return None
+
+        lines = []
+        for part in parts[:5]:  # Cap at 5 results
+            mpn = part.get("ManufacturerPartNumber") or part_number
+            mfr = part.get("Manufacturer") or "Unknown"
+            desc = part.get("Description") or ""
+            mouser_pn = part.get("MouserPartNumber") or ""
+            stock = part.get("Availability") or "Unknown"
+            datasheet = part.get("DataSheetUrl") or ""
+            product_url = part.get("ProductDetailUrl") or ""
+            rohs = part.get("ROHSStatus") or ""
+            lifecycle = part.get("LifecycleStatus") or ""
+
+            lines.append(f"# {mpn}\n")
+            lines.append(f"**Manufacturer:** {mfr}")
+            lines.append(f"**Description:** {desc}")
+            if mouser_pn:
+                lines.append(f"**Mouser P/N:** {mouser_pn}")
+            lines.append(f"**Stock:** {stock}")
+            if lifecycle:
+                lines.append(f"**Lifecycle:** {lifecycle}")
+            if rohs:
+                lines.append(f"**RoHS:** {rohs}")
+
+            # Pricing tiers
+            pricing = part.get("PriceBreaks", [])
+            if pricing:
+                lines.append("\n**Pricing:**")
+                lines.append("| Qty | Price |")
+                lines.append("|-----|-------|")
+                for tier in pricing:
+                    qty = tier.get("Quantity", "?")
+                    price = tier.get("Price", "?")
+                    currency = tier.get("Currency", "")
+                    lines.append(f"| {qty} | {price} {currency} |")
+
+            # Specs
+            attrs = part.get("ProductAttributes", [])
+            if attrs:
+                lines.append("\n**Specifications:**")
+                for attr in attrs:
+                    name = attr.get("AttributeName", "")
+                    val = attr.get("AttributeValue", "")
+                    if name and val:
+                        lines.append(f"- {name}: {val}")
+
+            if datasheet:
+                lines.append(f"\n📄 **Datasheet:** {datasheet}")
+            if product_url:
+                lines.append(f"🔗 **Product page:** {product_url}")
+
+            lines.append("")  # Separator between parts
+
+        return "\n".join(lines)
+    except Exception:
+        return None
+
+
 def _try_api_shortcuts(
     url: str, client: httpx.Client, deadline: Deadline
 ) -> tuple[str, str] | None:
-    for fn in (_try_reddit, _try_github, _try_huggingface):
+    for fn in (_try_reddit, _try_github, _try_huggingface, _try_mouser):
         try:
             deadline.remaining()  # Check before each attempt [#api-shortcuts-unbounded]
         except FetchPageError:
