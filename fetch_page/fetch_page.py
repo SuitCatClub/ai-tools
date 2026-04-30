@@ -585,7 +585,11 @@ def _fetch_playwright(url: str, timeout_ms: int, verify: bool) -> str:
             ctx = browser.new_context(**ctx_args)
             try:
                 page = ctx.new_page()
-                page.goto(url, timeout=timeout_ms, wait_until="networkidle")
+                # Use "load" first, then wait briefly for JS to settle.
+                # "networkidle" hangs on SPAs (Reddit, etc.) that never stop fetching.
+                page.goto(url, timeout=timeout_ms, wait_until="load")
+                # Give JS challenges and dynamic content a moment to render
+                page.wait_for_timeout(min(3000, timeout_ms // 3))
                 return page.content()
             finally:
                 ctx.close()
