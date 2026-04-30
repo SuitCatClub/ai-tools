@@ -70,6 +70,15 @@ class FetchPageError(RuntimeError):
     """Raised when page fetching fails without terminating the caller."""
 
 
+# Patterns that indicate a JS challenge page (httpx got 200 but content is useless)
+_CHALLENGE_SIGNATURES = [
+    "Please wait for verification",
+    "Just a moment...",           # Cloudflare
+    "Checking your browser",      # Cloudflare
+    "challenge-platform",         # Generic
+]
+
+
 # ---------------------------------------------------------------------------
 # Input validation [#url-scheme-validation, #timeout-zero-instant-fail,
 #                   #negative-delay-validation]
@@ -676,7 +685,17 @@ def fetch(
             json_out = _handle_json_response(resp, fmt)
             if json_out:
                 return _format_output(url, url, json_out, fmt)
-            html = resp.text
+
+            # Detect JS challenge pages — httpx got 200 but content needs a browser
+            raw_text = resp.text
+            if HAS_PLAYWRIGHT and any(sig in raw_text[:2000] for sig in _CHALLENGE_SIGNATURES):
+                print(
+                    "[info] JS challenge detected — falling back to Playwright",
+                    file=sys.stderr,
+                )
+                html = None  # Force Playwright fallback
+            else:
+                html = raw_text
 
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
