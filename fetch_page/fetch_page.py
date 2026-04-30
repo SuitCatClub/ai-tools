@@ -78,6 +78,24 @@ _CHALLENGE_SIGNATURES = [
     "challenge-platform",         # Generic
 ]
 
+# Soft bot walls — HTTP 200 but content is a gate page, not real content.
+# Detected by: short body + presence of a gate phrase.
+_BOT_GATE_PHRASES = [
+    "click the button below to continue shopping",  # Amazon
+    "continue shopping",                              # Amazon variant
+    "verify you are a human",
+    "are you a robot",
+    "please verify you are a human",
+    "access to this page has been denied",
+    "pardon our interruption",                        # Amazon CAPTCHA
+    "crawler is not allowed",                         # Unity Forums
+]
+
+_BOT_GATE_MAX_VISIBLE = 1500  # Visible text shorter than this with a gate phrase → wall
+
+# Minimum time (ms) to give Playwright — even if httpx consumed most of the budget
+_PLAYWRIGHT_MIN_TIMEOUT_MS = 10_000
+
 
 # ---------------------------------------------------------------------------
 # Input validation [#url-scheme-validation, #timeout-zero-instant-fail,
@@ -503,10 +521,16 @@ def _extract_content(html: str, fmt: str, url: str) -> tuple[str, str]:
     m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     title = html_lib.unescape(m.group(1).strip()) if m else ""  # [#html-entity-title]
 
+    # Pre-strip <script> tags — trafilatura/markdownify miss some inline JS
+    # (e.g. window.* assignments, JSON config blocks inside <script>)
+    clean_html = re.sub(
+        r"(?is)<script[^>]*>.*?</script>", "", html
+    )
+
     if fmt in ("markdown", "text") and HAS_TRAFILATURA:
         tf_fmt = "markdown" if fmt == "markdown" else "txt"  # [#format-text-crash]
         extracted = trafilatura.extract(
-            html,
+            clean_html,
             output_format=tf_fmt,
             url=url,
             include_comments=False,
@@ -517,11 +541,11 @@ def _extract_content(html: str, fmt: str, url: str) -> tuple[str, str]:
             return title, extracted
 
     if fmt == "html":
-        return title, html
+        return title, html  # Return original HTML for html format
 
     if fmt == "markdown" and HAS_MARKDOWNIFY:
         return title, md(
-            html,
+            clean_html,
             heading_style="ATX",
             strip=["script", "style", "noscript"],  # [#noscript-strip-list]
         )
@@ -698,8 +722,27 @@ def fetch(
                     file=sys.stderr,
                 )
                 html = None  # Force Playwright fallback
-            else:
-                html = raw_text
+
+            # Detect soft bot walls — HTTP 200 but thin visible content with gate phrases
+            elif HAS_PLAYWRIGHT:
+                visible = re.sub(r"<[^>]+>", " ", raw_text)
+                visible = re.sub(r"\s+", " ", visible).strip()
+                if len(visible) < _BOT_GATE_MAX_VISIBLE:
+                    lower_vis = visible.lower()
+                    gate = next(
+                        (p for p in _BOT_GATE_PHRASES if p in lower_vis), None
+                    )
+                    if gate:
+                        print(
+                            f'[info] Soft bot wall detected ("{gate}") — '
+                            "falling back to Playwright",
+                            file=sys.stderr,
+                        )
+                        html = None  # Force Playwright fallback
+                    else:
+                        html = raw_text
+                else:
+                    html = raw_text
 
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
@@ -787,7 +830,10 @@ def fetch(
         if html is None and HAS_PLAYWRIGHT:
             try:
                 pw_verify = verify and not ssl_retried  # [#ssl-playwright-propagation]
-                remaining_ms = int(deadline.remaining() * 1000)
+                remaining_ms = max(
+                    int(deadline.remaining() * 1000),
+                    _PLAYWRIGHT_MIN_TIMEOUT_MS,  # Don't starve Playwright
+                )
                 html = _fetch_playwright(url, remaining_ms, pw_verify)
             except FetchPageError:
                 raise
