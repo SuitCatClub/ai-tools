@@ -630,6 +630,26 @@ def fetch(
         if not ignore_robots:
             try:
                 allowed, crawl_delay = _robots_policy(url, client)
+            except httpx.RequestError as e:
+                # SSL failure during robots check — rebuild client now
+                # so API shortcuts benefit from the fix
+                err_str = str(e).lower()
+                ssl_kw = ("ssl", "certificate", "handshake", "tls", "wrong version", "cert")
+                if verify and any(k in err_str for k in ssl_kw):
+                    ssl_retried = True
+                    print(
+                        "[warning] SSL failed during robots check — "
+                        "switching to verify=False",
+                        file=sys.stderr,
+                    )
+                    client.close()
+                    client = _make_client(False, deadline.remaining_int())
+                    try:
+                        allowed, crawl_delay = _robots_policy(url, client)
+                    except Exception:
+                        allowed, crawl_delay = True, None
+                else:
+                    allowed, crawl_delay = True, None
             except Exception:
                 allowed, crawl_delay = True, None
             if not allowed:
